@@ -3,6 +3,10 @@
 A four-line status line for [Claude Code](https://code.claude.com) written in plain Python.
 No `jq`, no network calls, no extra dependencies.
 
+![Claude Code status line showing model, folder and branch, cost, timer, session name, and three circle progress bars for context, current and weekly limits](statusline.png)
+
+Plain text rendering:
+
 ```
 ◆ Fable 5.1 │ 📁 prounitas-backend (⎇ feature-branch*) │ $4.80 │ ⏱ 31m 58s │ ▸ Add statusline
 context ●○○○○○○○○○  11% 111k/1M
