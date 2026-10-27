@@ -1,8 +1,9 @@
 # claude-status-line
 
-A four-line status line for [Claude Code](https://code.claude.com) written in plain Python,
-plus one extra line for every model-scoped limit your plan has (Fable today).
-No `jq`, no network calls, no extra dependencies.
+A three-line status line for [Claude Code](https://code.claude.com) written in plain Python:
+one line of session info and a two-column grid of progress bars, including a separate bar for every
+model-scoped limit your plan has (Fable today).
+No `jq`, no extra dependencies, and no network calls unless you opt in to the live limit refresh below.
 
 ![Claude Code status line showing model, folder and branch, cost, timer, session name, and three circle progress bars for context, current and weekly limits](statusline.png)
 
@@ -10,10 +11,8 @@ Plain text rendering:
 
 ```
 ◆ Fable 5.1 │ 📁 prounitas-backend (⎇ feature-branch*) │ $4.80 │ ⏱ 31m 58s │ ▸ Add statusline
-context ●○○○○○○○○○  11% 111k/1M
-current ○○○○○○○○○○   2% ⟳ 8:10am ▲0%
-weekly  ●○○○○○○○○○  10% ⟳ sep 21, 5:00am ▲46%
-fable   ●●●○○○○○○○  29% ⟳ sep 21, 5:00am ▲27%
+context ●○○○○○○○○○  11% 111k/1M      │ weekly  ●○○○○○○○○○  10% ⟳ sep 21, 5:00am ▲46%
+current ○○○○○○○○○○   2% ⟳ 8:10am ▲0% │ fable   ●●●○○○○○○○  27% ⟳ sep 21, 5:00am ▲29%
 ```
 
 ## What it shows
@@ -28,7 +27,11 @@ fable   ●●●○○○○○○○  29% ⟳ sep 21, 5:00am ▲27%
 | `⏱ 31m 58s` | Wall-clock session duration |
 | `▸ name` | Session name from `/rename` or the AI-generated title. Hidden when absent |
 
-**Lines 2 onward**: aligned progress bars, ten circles each, filled to the nearest 10%.
+**Lines 2 and 3**: progress bars in two columns. The left column is what is current: the context
+window and the 5-hour limit. The right column is the weekly windows: the plain weekly limit and every
+model-scoped one. The left column is padded so the right column lines up. Each bar is ten circles and
+resolves to 5%: odd steps show the next circle filled but dimmed. Only `●` and `○` are used, because a
+third glyph such as `◐` often comes from a fallback font at a different size.
 
 | Row | Meaning |
 |---|---|
@@ -44,12 +47,32 @@ Colors follow one scale everywhere: green below 50%, orange to 69%, yellow to 89
 
 When Claude Code does not send rate limit data, the row shows a dim placeholder so the layout never shifts.
 
+The grid is about 90 columns wide. Set `CLAUDE_STATUSLINE_STACKED=1` to get one bar per row instead;
+the script also stacks on its own when it can read the terminal width and the grid would not fit.
+
 **Model-scoped limits.** Claude Code's status line input only carries the 5-hour and 7-day windows.
 The per-model buckets (the separate Fable allowance, for example) are read from the usage snapshot
-Claude Code itself caches in `~/.claude.json` (honours `CLAUDE_CONFIG_DIR`). Claude Code refreshes that
-snapshot about once a minute while a session is active, so the row tracks `/usage` closely.
-If the snapshot is older than 15 minutes the row ends with a dim `Nm old` marker.
+Claude Code itself caches in `~/.claude.json` (honours `CLAUDE_CONFIG_DIR`). Claude Code fetches that
+snapshot at session start and when you open `/usage`, not continuously. To keep the bar moving in
+between, the script uses the fact that the snapshot states the bucket's allowance as a share of the
+weekly budget: while the session runs that model, any growth of the live weekly number is that model's
+usage, so it is projected onto the bucket. When the session runs a different model the snapshot value is
+shown as is, with a dim `Nh old` marker once it is more than an hour old. Opening `/usage` refreshes it.
 Should a future Claude Code version start sending such a window on stdin, the live value is used instead.
+
+**Live refresh (opt-in).** Set `CLAUDE_STATUSLINE_FETCH_USAGE=1` and the script asks the same usage
+endpoint Claude Code uses, at most once a minute, from a detached background process so the status line
+never waits on the network. It authenticates with the OAuth access token Claude Code already stores in
+`~/.claude/.credentials.json`; the token is sent only to `api.anthropic.com` and never written anywhere
+else. The result lands in `~/.claude/statusline-usage.json` and is used whenever it is newer than
+Claude Code's own snapshot. On macOS the token lives in the keychain rather than a file, so the refresh
+stays inactive there. Enable it via the `env` block in `~/.claude/settings.json`:
+
+```json
+{
+  "env": { "CLAUDE_STATUSLINE_FETCH_USAGE": "1" }
+}
+```
 
 ## Install
 
@@ -89,9 +112,11 @@ To preview the model-scoped row without a real snapshot, point `CLAUDE_CONFIG_DI
 `.claude.json` like this and run the command above with that variable set:
 
 ```json
-{"cachedUsageUtilization":{"fetchedAtMs":1793107182707,"utilization":{"limits":[
-  {"kind":"weekly_scoped","percent":29,"resets_at":"2026-11-02T01:59:59+00:00",
-   "scope":{"model":{"display_name":"Fable"}}}]}}}
+{"cachedUsageUtilization":{"fetchedAtMs":1793107182707,"utilization":{
+  "seven_day":{"utilization":15},
+  "limits":[{"kind":"weekly_scoped","percent":29,"resets_at":"2026-11-02T01:59:59+00:00",
+             "scope":{"model":{"display_name":"Fable"}}}],
+  "weekly_scoped_shares":[{"limit_index":0,"used_percent_of_weekly":15,"allowance_percent_of_weekly":50}]}}}
 ```
 
 ## Credits

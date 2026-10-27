@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Claude Code status line: model, folder/branch, cost, timer, and circle
-progress bars for context, 5-hour and 7-day rate limits, plus one bar per
-model-scoped limit (e.g. Fable) read from Claude Code's cached usage snapshot.
+"""Claude Code status line: model, folder/branch, cost, timer, and a two-column
+grid of circle progress bars for context, 5-hour and 7-day rate limits, plus one
+bar per model-scoped limit (e.g. Fable) read from Claude Code's usage snapshot.
 
 https://github.com/denyswsu/claude-status-line
 """
@@ -10,6 +10,82 @@ from datetime import datetime
 
 # Force UTF-8 output on Windows
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+
+# ── Optional live refresh of the usage snapshot ──────────────
+# Claude Code refreshes its own usage snapshot only at session start and on
+# /usage. With CLAUDE_STATUSLINE_FETCH_USAGE=1 this script asks the same
+# endpoint itself, at most once a minute, from a detached child process so
+# rendering never waits on the network. It uses the OAuth access token Claude
+# Code keeps in <config dir>/.credentials.json; the token is sent only to
+# api.anthropic.com and never written anywhere. Where the token lives in a
+# keychain instead (macOS) there is no file and the refresh stays inactive.
+FETCH_EVERY_SECS = 60
+USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+
+
+def config_dir():
+    return os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude')
+
+
+def usage_cache_path():
+    return os.path.join(config_dir(), 'statusline-usage.json')
+
+
+def file_age(path):
+    try:
+        return time.time() - os.path.getmtime(path)
+    except OSError:
+        return float('inf')
+
+
+def maybe_refresh_usage():
+    if os.environ.get('CLAUDE_STATUSLINE_FETCH_USAGE') != '1':
+        return
+    cache = usage_cache_path()
+    lock = cache + '.lock'
+    if file_age(cache) < FETCH_EVERY_SECS or file_age(lock) < 30:
+        return
+    try:
+        with open(lock, 'w'):
+            pass
+        detach = ({'creationflags': 0x00000008 | 0x00000200} if os.name == 'nt'
+                  else {'start_new_session': True})
+        subprocess.Popen([sys.executable or 'python3', os.path.abspath(__file__), '--fetch-usage'],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, **detach)
+    except Exception:
+        pass
+
+
+def fetch_usage():
+    """Child-process mode: one GET, write the cache atomically, exit."""
+    import urllib.request
+    try:
+        with open(os.path.join(config_dir(), '.credentials.json'), encoding='utf-8') as f:
+            oauth = json.load(f).get('claudeAiOauth') or {}
+        token = oauth.get('accessToken')
+        if not token or (oauth.get('expiresAt') or 0) / 1000 < time.time():
+            return  # expired: Claude Code renews it on its own; try again next minute
+        req = urllib.request.Request(USAGE_URL, headers={
+            'Authorization': 'Bearer ' + token,
+            'anthropic-beta': 'oauth-2025-04-20',
+            'Accept': 'application/json',
+            'User-Agent': 'claude-status-line',
+        })
+        with urllib.request.urlopen(req, timeout=8) as r:
+            body = json.load(r)
+        cache = usage_cache_path()
+        with open(cache + '.tmp', 'w', encoding='utf-8') as f:
+            json.dump({'fetchedAtMs': int(time.time() * 1000), 'utilization': body}, f)
+        os.replace(cache + '.tmp', cache)
+    except Exception:
+        pass
+
+
+if '--fetch-usage' in sys.argv:
+    fetch_usage()
+    sys.exit(0)
 
 raw = sys.stdin.read()
 if os.environ.get('CLAUDE_STATUSLINE_DEBUG'):
@@ -86,9 +162,17 @@ except Exception:
 
 # ── Rate limits as circle bars ───────────────────────────
 def circle_bar(used_pct, width=10):
+    """Ten circles, 5% per step: odd steps show a dimmed filled circle. Only
+    ● and ○ are used, since a third glyph such as ◐ often comes from a
+    fallback font at a different size."""
     used_pct = max(0, min(100, used_pct))
-    n = (used_pct * width + 50) // 100  # round half up to nearest circle
-    return f'{color_for_pct(used_pct)}{"●" * n}{DIM}{"○" * (width - n)}{RESET}'
+    halves = int((used_pct * width * 2 + 50) // 100)  # round half up to nearest 5%
+    full, half = divmod(halves, 2)
+    color = color_for_pct(used_pct)
+    out = f'{color}{"●" * full}'
+    if half:
+        out += f'{RESET}{DIM}{color}●'
+    return f'{out}{RESET}{DIM}{"○" * (width - full - half)}{RESET}'
 
 
 def fmt_reset(resets_at, weekly):
@@ -110,7 +194,7 @@ def pace_str(used_pct, resets_at, window_mins):
     remaining_mins = max(0, (resets_at - now) // 60)
     if remaining_mins > window_mins:
         return ''
-    pace = (window_mins - remaining_mins) * 100 // window_mins - used_pct
+    pace = (window_mins - remaining_mins) * 100 // window_mins - int(used_pct)
     if pace >= 0:
         return f'{GREEN}▲{pace}%{RESET}'
     return f'{RED}▼{abs(pace)}%{RESET}'
@@ -127,11 +211,11 @@ def fmt_tokens(n):
 
 
 def row(label, used_pct, label_color=WHITE):
-    used_pct = int(used_pct)
+    pct_int = int(used_pct)
     return [
         f'{label_color}{label:<7}{RESET}',
         circle_bar(used_pct),
-        f'{color_for_pct(used_pct)}{used_pct:>3d}%{RESET}',
+        f'{color_for_pct(pct_int)}{pct_int:>3d}%{RESET}',
     ]
 
 
@@ -153,9 +237,10 @@ def placeholder_line(label):
 # ── Model-scoped limits (Fable today, whatever comes next) ──
 # Claude Code only puts the plain 5-hour and 7-day windows on stdin. The
 # per-model weekly buckets are in the usage snapshot it caches in
-# ~/.claude.json (cachedUsageUtilization.utilization.limits[]), refreshed at
-# most once a minute while a session is active and valid for an hour.
-STALE_AFTER_SECS = 15 * 60
+# ~/.claude.json (cachedUsageUtilization.utilization.limits[]). That snapshot
+# is fetched at session start and when /usage is opened, not continuously, so
+# live_estimate() below keeps the bar moving in between.
+STALE_AFTER_SECS = 60 * 60
 
 
 def parse_iso(s):
@@ -181,20 +266,39 @@ def claude_config_file():
     return None
 
 
-def scoped_limits():
-    """[(label, used_pct, resets_at, window_mins, age_secs)] for every limit in
-    the cached snapshot that is scoped to a model or surface."""
+def load_snapshot():
+    """The newer of Claude Code's own cached snapshot and this script's refresh."""
+    snap = {}
     path = claude_config_file()
-    if not path:
-        return []
+    if path:
+        try:
+            with open(path, encoding='utf-8') as f:
+                snap = json.load(f).get('cachedUsageUtilization') or {}
+        except Exception:
+            snap = {}
     try:
-        with open(path, encoding='utf-8') as f:
-            snap = json.load(f).get('cachedUsageUtilization') or {}
+        with open(usage_cache_path(), encoding='utf-8') as f:
+            ours = json.load(f)
+        if (ours.get('fetchedAtMs') or 0) > (snap.get('fetchedAtMs') or 0):
+            snap = ours
     except Exception:
+        pass
+    return snap
+
+
+def scoped_limits():
+    """One dict per limit in the cached snapshot that is scoped to a model or
+    surface, plus what is needed to project it forward from live data."""
+    snap = load_snapshot()
+    if not snap:
         return []
     age = max(0, int(time.time() - (snap.get('fetchedAtMs') or 0) / 1000))
+    util = snap.get('utilization') or {}
+    weekly0 = (util.get('seven_day') or {}).get('utilization')
+    shares = {sh.get('limit_index'): sh for sh in util.get('weekly_scoped_shares') or []
+              if isinstance(sh, dict)}
     out = []
-    for lim in (snap.get('utilization') or {}).get('limits') or []:
+    for idx, lim in enumerate(util.get('limits') or []):
         scope = lim.get('scope') or {}
         name = ((scope.get('model') or {}).get('display_name')
                 or (scope.get('surface') or {}).get('display_name'))
@@ -202,8 +306,32 @@ def scoped_limits():
             continue
         kind = lim.get('kind') or ''
         window = 10080 if kind.startswith('weekly') else 300 if kind.startswith('session') else 0
-        out.append((name.lower()[:7], lim['percent'], parse_iso(lim.get('resets_at')), window, age))
+        out.append({
+            'name': name.lower(), 'label': name.lower()[:7], 'pct': lim['percent'],
+            'resets': parse_iso(lim.get('resets_at')), 'window': window, 'age': age,
+            'weekly0': weekly0, 'share': shares.get(idx) if kind.startswith('weekly') else None,
+        })
     return out
+
+
+def live_estimate(lim, weekly_now, model_names):
+    """The scoped bucket's growth since the snapshot is not on stdin, but the
+    weekly window is. While this session runs that model, growth of the weekly
+    number is that model's usage, so project it onto the bucket's allowance
+    (weekly_scoped_shares gives the allowance as a share of the weekly budget).
+    Returns None when the projection is not possible, e.g. another model."""
+    share = lim['share'] or {}
+    allowance = share.get('allowance_percent_of_weekly')
+    if weekly_now is None or lim['weekly0'] is None or not allowance:
+        return None
+    if not any(lim['name'] in n for n in model_names):
+        return None
+    grown = weekly_now - lim['weekly0']
+    if grown < 0:  # the weekly window reset after the snapshot was taken
+        est = weekly_now * 100 / allowance
+    else:
+        est = lim['pct'] + grown * 100 / allowance
+    return max(0, min(100, est))
 
 
 def age_str(secs):
@@ -235,6 +363,7 @@ else:
 
 # Any extra window Claude Code starts sending on stdin (e.g. a future
 # seven_day_overage_included) is live, so it wins over the cached snapshot.
+maybe_refresh_usage()
 scoped = scoped_limits()
 for key, win in rl.items():
     if key in ('five_hour', 'seven_day', 'spend_limit') or not isinstance(win, dict):
@@ -243,18 +372,65 @@ for key, win in rl.items():
         continue
     label = key.replace('seven_day_', '')[:7]
     resets = win.get('resets_at') or 0
-    for i, (name, _p, r_at, _w, _a) in enumerate(scoped):
-        if resets and abs(r_at - resets) < 120:  # same window → borrow its name
-            label = name
+    for i, lim in enumerate(scoped):
+        if resets and abs(lim['resets'] - resets) < 120:  # same window → borrow its name
+            label = lim['label']
             del scoped[i]
             break
     rl_lines.append(limit_line(label, win['used_percentage'], resets, 10080, weekly=True,
                                label_color=PINK))
 
-for name, used, resets, window, age in scoped:
-    line = limit_line(name, used, resets, window, weekly=(window != 300), label_color=PINK)
-    stale = age_str(age)
+model_names = [model.lower(), (data.get('model', {}).get('id') or '').lower()]
+for lim in scoped:
+    est = live_estimate(lim, seven_day.get('used_percentage'), model_names)
+    used = lim['pct'] if est is None else est
+    line = limit_line(lim['label'], used, lim['resets'], lim['window'],
+                      weekly=(lim['window'] != 300), label_color=PINK)
+    stale = age_str(lim['age']) if est is None else ''  # a projected bar is not stale
     rl_lines.append(line + (' ' + stale if stale else ''))
+
+# ── Layout: bars two per row, left column padded to align ──
+ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def visible_len(text):
+    return len(ANSI_RE.sub('', text))
+
+
+def terminal_columns():
+    """Best effort. stdout is a pipe here, so ask the controlling tty."""
+    env = os.environ.get('COLUMNS', '')
+    if env.isdigit() and int(env) > 0:
+        return int(env)
+    try:
+        fd = os.open('/dev/tty', os.O_RDONLY | os.O_NOCTTY)
+        try:
+            return os.get_terminal_size(fd).columns
+        finally:
+            os.close(fd)
+    except Exception:
+        return None
+
+
+def grid(left, right):
+    """Two columns: what is current on the left, the weekly windows on the
+    right. Falls back to one cell per row when forced with
+    CLAUDE_STATUSLINE_STACKED=1 or when the terminal is known to be too narrow."""
+    left_w = max(visible_len(c) for c in left)
+    right_w = max((visible_len(c) for c in right), default=0)
+    need = left_w + visible_len(SEP) + right_w
+    cols = terminal_columns()
+    if os.environ.get('CLAUDE_STATUSLINE_STACKED') == '1' or (cols and cols < need):
+        return left + right
+    out = []
+    for i in range(max(len(left), len(right))):
+        l = left[i] if i < len(left) else ''
+        if i < len(right):
+            out.append(l + ' ' * (left_w - visible_len(l)) + SEP + right[i])
+        else:
+            out.append(l)
+    return out
+
 
 # ── Output ───────────────────────────────────────────────
 dur = f'{BCYAN}⏱ {mins}m {secs:02d}s{RESET}'
@@ -265,6 +441,5 @@ print(line1)
 
 ctx_parts = row('context', pct)
 ctx_parts.append(f'{DIM}{fmt_tokens(ctx_tokens)}/{fmt_tokens(ctx_size)}{RESET}')
-print(' '.join(ctx_parts))
-for line in rl_lines:
+for line in grid([' '.join(ctx_parts), rl_lines[0]], rl_lines[1:]):
     print(line)
