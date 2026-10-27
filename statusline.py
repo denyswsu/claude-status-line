@@ -20,7 +20,9 @@ sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 # Code keeps in <config dir>/.credentials.json; the token is sent only to
 # api.anthropic.com and never written anywhere. Where the token lives in a
 # keychain instead (macOS) there is no file and the refresh stays inactive.
-FETCH_EVERY_SECS = 60
+FETCH_EVERY_SECS = 120
+DEFAULT_HOLD_SECS = 300   # after a 429/403 without Retry-After; same as Claude Code
+MAX_HOLD_SECS = 3600
 USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 
 
@@ -32,11 +34,47 @@ def usage_cache_path():
     return os.path.join(config_dir(), 'statusline-usage.json')
 
 
+def usage_state_path():
+    return os.path.join(config_dir(), 'statusline-usage.state.json')
+
+
+def read_state():
+    try:
+        with open(usage_state_path(), encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def write_state(state):
+    """Outcome of the last fetch: status, Retry-After and the hold it implies."""
+    try:
+        path = usage_state_path()
+        with open(path + '.tmp', 'w', encoding='utf-8') as f:
+            json.dump(state, f)
+        os.replace(path + '.tmp', path)
+    except Exception:
+        pass
+
+
 def file_age(path):
     try:
         return time.time() - os.path.getmtime(path)
     except OSError:
         return float('inf')
+
+
+def retry_after_secs(value):
+    """Retry-After is either seconds or an HTTP date."""
+    if not value:
+        return 0
+    if value.strip().isdigit():
+        return int(value)
+    try:
+        from email.utils import parsedate_to_datetime
+        return max(0, int(parsedate_to_datetime(value).timestamp() - time.time()))
+    except Exception:
+        return 0
 
 
 def maybe_refresh_usage():
@@ -46,6 +84,8 @@ def maybe_refresh_usage():
     lock = cache + '.lock'
     if file_age(cache) < FETCH_EVERY_SECS or file_age(lock) < 30:
         return
+    if (read_state().get('hold_until') or 0) > time.time():
+        return  # the endpoint asked us to back off
     try:
         with open(lock, 'w'):
             pass
@@ -61,12 +101,15 @@ def maybe_refresh_usage():
 def fetch_usage():
     """Child-process mode: one GET, write the cache atomically, exit."""
     import urllib.request
+    import urllib.error
+    now = int(time.time())
     try:
         with open(os.path.join(config_dir(), '.credentials.json'), encoding='utf-8') as f:
             oauth = json.load(f).get('claudeAiOauth') or {}
         token = oauth.get('accessToken')
         if not token or (oauth.get('expiresAt') or 0) / 1000 < time.time():
-            return  # expired: Claude Code renews it on its own; try again next minute
+            write_state({'status': 'token_expired', 'at': now, 'hold_until': now + 60})
+            return  # Claude Code renews the token on its own
         req = urllib.request.Request(USAGE_URL, headers={
             'Authorization': 'Bearer ' + token,
             'anthropic-beta': 'oauth-2025-04-20',
@@ -77,10 +120,22 @@ def fetch_usage():
             body = json.load(r)
         cache = usage_cache_path()
         with open(cache + '.tmp', 'w', encoding='utf-8') as f:
-            json.dump({'fetchedAtMs': int(time.time() * 1000), 'utilization': body}, f)
+            json.dump({'fetchedAtMs': now * 1000, 'utilization': body}, f)
         os.replace(cache + '.tmp', cache)
-    except Exception:
-        pass
+        write_state({'status': 200, 'at': now})
+    except urllib.error.HTTPError as e:
+        retry = e.headers.get('Retry-After')
+        hold = 60
+        if e.code in (429, 403):
+            hold = min(retry_after_secs(retry) or DEFAULT_HOLD_SECS, MAX_HOLD_SECS)
+        try:
+            detail = e.read(300).decode('utf-8', 'replace')
+        except Exception:
+            detail = ''
+        write_state({'status': e.code, 'at': now, 'retry_after': retry,
+                     'hold_until': now + hold, 'detail': detail})
+    except Exception as e:
+        write_state({'status': 'error', 'at': now, 'hold_until': now + 60, 'detail': str(e)[:200]})
 
 
 if '--fetch-usage' in sys.argv:

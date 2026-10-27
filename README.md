@@ -61,8 +61,10 @@ shown as is, with a dim `Nh old` marker once it is more than an hour old. Openin
 Should a future Claude Code version start sending such a window on stdin, the live value is used instead.
 
 **Live refresh (opt-in).** Set `CLAUDE_STATUSLINE_FETCH_USAGE=1` and the script asks the same usage
-endpoint Claude Code uses, at most once a minute, from a detached background process so the status line
-never waits on the network. It authenticates with the OAuth access token Claude Code already stores in
+endpoint Claude Code uses, at most every two minutes, from a detached background process so the status
+line never waits on the network. The endpoint is rate limited and the quota is shared with Claude Code's
+own `/usage`, so on a 429 the script backs off for the `Retry-After` the server gives, or five minutes,
+and records the outcome in `~/.claude/statusline-usage.state.json`. It authenticates with the OAuth access token Claude Code already stores in
 `~/.claude/.credentials.json`; the token is sent only to `api.anthropic.com` and never written anywhere
 else. The result lands in `~/.claude/statusline-usage.json` and is used whenever it is newer than
 Claude Code's own snapshot. On macOS the token lives in the keychain rather than a file, so the refresh
