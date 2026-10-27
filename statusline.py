@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Claude Code status line: model, folder/branch, cost, timer, and circle
-progress bars for context, 5-hour and 7-day rate limits.
+progress bars for context, 5-hour and 7-day rate limits, plus one bar per
+model-scoped limit (e.g. Fable) read from Claude Code's cached usage snapshot.
 
 https://github.com/denyswsu/claude-status-line
 """
-import json, sys, subprocess, os, time
+import json, sys, subprocess, os, time, re, calendar
 from datetime import datetime
 
 # Force UTF-8 output on Windows
@@ -125,17 +126,17 @@ def fmt_tokens(n):
     return str(n)
 
 
-def row(label, used_pct):
+def row(label, used_pct, label_color=WHITE):
     used_pct = int(used_pct)
     return [
-        f'{WHITE}{label:<7}{RESET}',
+        f'{label_color}{label:<7}{RESET}',
         circle_bar(used_pct),
         f'{color_for_pct(used_pct)}{used_pct:>3d}%{RESET}',
     ]
 
 
-def limit_line(label, used_pct, resets_at, window_mins, weekly):
-    parts = row(label, used_pct)
+def limit_line(label, used_pct, resets_at, window_mins, weekly, label_color=WHITE):
+    parts = row(label, used_pct, label_color)
     reset_s = fmt_reset(resets_at, weekly)
     if reset_s:
         parts.append(f'{DIM}⟳{RESET} {WHITE}{reset_s}{RESET}')
@@ -147,6 +148,72 @@ def limit_line(label, used_pct, resets_at, window_mins, weekly):
 
 def placeholder_line(label):
     return f'{WHITE}{label:<7}{RESET} {DIM}{"○" * 10}   –%  no data{RESET}'
+
+
+# ── Model-scoped limits (Fable today, whatever comes next) ──
+# Claude Code only puts the plain 5-hour and 7-day windows on stdin. The
+# per-model weekly buckets are in the usage snapshot it caches in
+# ~/.claude.json (cachedUsageUtilization.utilization.limits[]), refreshed at
+# most once a minute while a session is active and valid for an hour.
+STALE_AFTER_SECS = 15 * 60
+
+
+def parse_iso(s):
+    """ISO-8601 timestamp → epoch seconds. Hand-rolled so Python 3.6 works."""
+    m = re.match(r'(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?$', s or '')
+    if not m:
+        return 0
+    ts = calendar.timegm(tuple(int(x) for x in m.groups()[:6]))
+    tz = m.group(7)
+    if tz and tz != 'Z':
+        off = tz[1:].replace(':', '')
+        delta = int(off[:2]) * 3600 + int(off[2:]) * 60
+        ts -= delta if tz[0] == '+' else -delta
+    return ts
+
+
+def claude_config_file():
+    d = os.environ.get('CLAUDE_CONFIG_DIR')
+    candidates = ([os.path.join(d, '.claude.json')] if d else []) + [os.path.expanduser('~/.claude.json')]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def scoped_limits():
+    """[(label, used_pct, resets_at, window_mins, age_secs)] for every limit in
+    the cached snapshot that is scoped to a model or surface."""
+    path = claude_config_file()
+    if not path:
+        return []
+    try:
+        with open(path, encoding='utf-8') as f:
+            snap = json.load(f).get('cachedUsageUtilization') or {}
+    except Exception:
+        return []
+    age = max(0, int(time.time() - (snap.get('fetchedAtMs') or 0) / 1000))
+    out = []
+    for lim in (snap.get('utilization') or {}).get('limits') or []:
+        scope = lim.get('scope') or {}
+        name = ((scope.get('model') or {}).get('display_name')
+                or (scope.get('surface') or {}).get('display_name'))
+        if not name or lim.get('percent') is None:
+            continue
+        kind = lim.get('kind') or ''
+        window = 10080 if kind.startswith('weekly') else 300 if kind.startswith('session') else 0
+        out.append((name.lower()[:7], lim['percent'], parse_iso(lim.get('resets_at')), window, age))
+    return out
+
+
+def age_str(secs):
+    if secs < STALE_AFTER_SECS:
+        return ''
+    if secs < 3600:
+        return f'{DIM}{secs // 60}m old{RESET}'
+    if secs < 86400:
+        return f'{DIM}{secs // 3600}h old{RESET}'
+    return f'{DIM}{secs // 86400}d old{RESET}'
 
 
 rl = data.get('rate_limits') or {}
@@ -165,6 +232,29 @@ if seven_day.get('used_percentage') is not None:
                                seven_day.get('resets_at') or 0, 10080, weekly=True))
 else:
     rl_lines.append(placeholder_line('weekly'))
+
+# Any extra window Claude Code starts sending on stdin (e.g. a future
+# seven_day_overage_included) is live, so it wins over the cached snapshot.
+scoped = scoped_limits()
+for key, win in rl.items():
+    if key in ('five_hour', 'seven_day', 'spend_limit') or not isinstance(win, dict):
+        continue
+    if win.get('used_percentage') is None:
+        continue
+    label = key.replace('seven_day_', '')[:7]
+    resets = win.get('resets_at') or 0
+    for i, (name, _p, r_at, _w, _a) in enumerate(scoped):
+        if resets and abs(r_at - resets) < 120:  # same window → borrow its name
+            label = name
+            del scoped[i]
+            break
+    rl_lines.append(limit_line(label, win['used_percentage'], resets, 10080, weekly=True,
+                               label_color=PINK))
+
+for name, used, resets, window, age in scoped:
+    line = limit_line(name, used, resets, window, weekly=(window != 300), label_color=PINK)
+    stale = age_str(age)
+    rl_lines.append(line + (' ' + stale if stale else ''))
 
 # ── Output ───────────────────────────────────────────────
 dur = f'{BCYAN}⏱ {mins}m {secs:02d}s{RESET}'
